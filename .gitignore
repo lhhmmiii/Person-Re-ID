@@ -1,0 +1,25 @@
+# Pycache
+__pycache__/
+*.py[cod]
+*.so
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Env
+.venv/
+venv/
+env/
+ENV/
+.env
+
+.DS_Store
+.idea/
+
+# Checkpoints
+checkpoints/
+results/
+src/logs/
+src/YOLOX_outputs/
