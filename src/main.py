@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
-from routers import tracking_router
+from routers import tracking_router, videos_router
 
 # Configure logger
 logger.remove()
@@ -38,6 +38,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(tracking_router)
+app.include_router(videos_router)
 
 
 @app.get("/")
