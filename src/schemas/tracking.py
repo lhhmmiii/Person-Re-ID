@@ -43,5 +43,4 @@ class TrackingResponseSchema(BaseModel):
     """Response schema for tracking endpoint"""
     status: str = Field(description="Status of the tracking operation")
     message: str = Field(description="Status message")
-    results_file: Optional[str] = Field(default=None, description="Path to results file")
-    saved_folder: Optional[str] = Field(default=None, description="Path to saved outputs folder")
+    output_path: Optional[str] = Field(description="video output path")

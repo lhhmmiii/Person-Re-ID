@@ -3,6 +3,8 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 import os.path as osp
 import time
+import io
+import tempfile
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -10,6 +12,7 @@ import cv2
 import torch
 
 from loguru import logger
+from dotenv import load_dotenv
 
 from external.ByteTrack.yolox.data.data_augment import preproc
 from external.ByteTrack.yolox.exp import get_exp
@@ -17,6 +20,10 @@ from external.ByteTrack.yolox.utils import fuse_model, get_model_info, postproce
 from external.ByteTrack.yolox.utils.visualize import plot_tracking
 from external.ByteTrack.yolox.tracker.byte_tracker import BYTETracker
 from external.ByteTrack.yolox.tracking_utils.timer import Timer
+from utils.minio_utils import MinioUtils
+
+# Load .env
+load_dotenv("../.env")
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -45,31 +52,6 @@ class TrackingConfig:
     aspect_ratio_thresh: float = 1.6
     min_box_area: float = 10
     mot20: bool = False
-
-
-def get_image_list(path):
-    image_names = []
-    for maindir, subdir, file_name_list in os.walk(path):
-        for filename in file_name_list:
-            apath = osp.join(maindir, filename)
-            ext = osp.splitext(apath)[1]
-            if ext in IMAGE_EXT:
-                image_names.append(apath)
-    return image_names
-
-
-def write_results(filename, results):
-    save_format = '{frame},{id},{x1},{y1},{w},{h},{s},-1,-1,-1\n'
-    with open(filename, 'w') as f:
-        for frame_id, tlwhs, track_ids, scores in results:
-            for tlwh, track_id, score in zip(tlwhs, track_ids, scores):
-                if track_id < 0:
-                    continue
-                x1, y1, w, h = tlwh
-                line = save_format.format(frame=frame_id, id=track_id, x1=round(x1, 1), y1=round(y1, 1), w=round(w, 1), h=round(h, 1), s=round(score, 2))
-                f.write(line)
-    logger.info('save results to {}'.format(filename))
-
 
 class Predictor(object):
     def __init__(
@@ -131,20 +113,28 @@ class Predictor(object):
             #logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, img_info
 
-
 class ByteTrackService:
     def __init__(self, config: Optional[TrackingConfig] = None):
         self.config = config or TrackingConfig()
         self.exp = get_exp(self.config.exp_file, self.config.name)
+        
+        # Load MinIO configuration and initialize MinioUtils
+        self.minio_utils = MinioUtils(
+            bucket_name=os.getenv("MINIO_BUCKET", "videos"),
+            endpoint=os.getenv("MINIO_ENDPOINT"),
+            access_key=os.getenv("MINIO_ACCESS_KEY"),
+            secret_key=os.getenv("MINIO_SECRET_KEY"),
+        )
 
     def run(self):
-        predictor, vis_folder = self._prepare_predictor_and_output()
+        predictor = self._prepare_predictor_and_output()
         current_time = time.localtime()
 
-        if self.config.demo == "image":
-            self._image_demo(predictor, vis_folder, current_time)
-        elif self.config.demo in {"video", "webcam"}:
-            self._imageflow_demo(predictor, vis_folder, current_time)
+        if self.config.demo == "video":
+            output_path = self._imageflow_demo(predictor, current_time)
+            return output_path
+        elif self.config.demo == "webcam":
+            pass
         else:
             raise ValueError(f"Unsupported demo type: {self.config.demo}")
 
@@ -154,11 +144,6 @@ class ByteTrackService:
 
         output_dir = osp.join(self.exp.output_dir, self.config.experiment_name)
         os.makedirs(output_dir, exist_ok=True)
-
-        vis_folder = None
-        if self.config.save_result:
-            vis_folder = osp.join(output_dir, "track_vis")
-            os.makedirs(vis_folder, exist_ok=True)
 
         if self.config.trt:
             self.config.device = "gpu"
@@ -208,76 +193,9 @@ class ByteTrackService:
             decoder = None
 
         predictor = Predictor(model, self.exp, trt_file, decoder, device, self.config.fp16)
-        return predictor, vis_folder
+        return predictor
 
-    def _image_demo(self, predictor, vis_folder, current_time):
-        if osp.isdir(self.config.path):
-            files = get_image_list(self.config.path)
-        else:
-            files = [self.config.path]
-        files.sort()
-        tracker = BYTETracker(self.config, frame_rate=self.config.fps)
-        timer = Timer()
-        results: List[str] = []
-
-        timestamp = None
-        save_folder = None
-        if self.config.save_result:
-            timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            save_folder = osp.join(vis_folder, timestamp)
-            os.makedirs(save_folder, exist_ok=True)
-
-        for frame_id, img_path in enumerate(files, 1):
-            outputs, img_info = predictor.inference(img_path, timer)
-            if outputs[0] is not None:
-                online_targets = tracker.update(
-                    outputs[0], [img_info["height"], img_info["width"]], self.exp.test_size
-                )
-                online_tlwhs = []
-                online_ids = []
-                for t in online_targets:
-                    tlwh = t.tlwh
-                    tid = t.track_id
-                    vertical = tlwh[2] / tlwh[3] > self.config.aspect_ratio_thresh
-                    if tlwh[2] * tlwh[3] > self.config.min_box_area and not vertical:
-                        online_tlwhs.append(tlwh)
-                        online_ids.append(tid)
-                        results.append(
-                            f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-                        )
-                timer.toc()
-                online_im = plot_tracking(
-                    img_info["raw_img"],
-                    online_tlwhs,
-                    online_ids,
-                    frame_id=frame_id,
-                    fps=1.0 / timer.average_time,
-                )
-            else:
-                timer.toc()
-                online_im = img_info["raw_img"]
-
-            if self.config.save_result:
-                cv2.imwrite(osp.join(save_folder, osp.basename(img_path)), online_im)
-
-            if frame_id % 20 == 0:
-                logger.info(
-                    "Processing frame {} ({:.2f} fps)".format(
-                        frame_id, 1.0 / max(1e-5, timer.average_time)
-                    )
-                )
-
-            ch = cv2.waitKey(0)
-            if ch == 27 or ch == ord("q") or ch == ord("Q"):
-                break
-
-        if self.config.save_result:
-            res_file = osp.join(vis_folder, f"{timestamp}.txt")
-            with open(res_file, "w") as f:
-                f.writelines(results)
-            logger.info(f"save results to {res_file}")
-
-    def _imageflow_demo(self, predictor, vis_folder, current_time):
+    def _imageflow_demo(self, predictor, current_time):
         cap = cv2.VideoCapture(self.config.path if self.config.demo == "video" else self.config.camid)
         width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
         height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
@@ -290,15 +208,20 @@ class ByteTrackService:
 
         timestamp = None
         vid_writer = None
+        save_path = None
         if self.config.save_result:
             timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            save_folder = osp.join(vis_folder, timestamp)
-            os.makedirs(save_folder, exist_ok=True)
+            # write to a temporary local file then upload to MinIO if available
             if self.config.demo == "video":
-                save_path = osp.join(save_folder, self.config.path.split("/")[-1])
+                base_name = osp.basename(self.config.path)
             else:
-                save_path = osp.join(save_folder, "camera.mp4")
-            logger.info(f"video save_path is {save_path}")
+                base_name = "camera.mp4"
+            
+            # Create tempfile for upload to Minio
+            tmp_vid = tempfile.NamedTemporaryFile(delete=False, suffix=osp.splitext(base_name)[1])
+            tmp_vid.close()
+            save_path = tmp_vid.name
+            logger.info(f"temporary video path is {save_path}")
             vid_writer = cv2.VideoWriter(
                 save_path,
                 cv2.VideoWriter_fourcc(*"mp4v"),
@@ -359,8 +282,41 @@ class ByteTrackService:
         if vid_writer is not None:
             vid_writer.release()
 
+        uploaded_video_url = None
+        uploaded_results_url = None
         if self.config.save_result:
-            res_file = osp.join(vis_folder, f"{timestamp}.txt")
-            with open(res_file, "w") as f:
-                f.writelines(results)
-            logger.info(f"save results to {res_file}")
+            # upload video file to MinIO if MinioUtils is initialized
+            if self.minio_utils is not None:
+                try:
+                    object_name = f"tracked/{timestamp}/{base_name}"
+                    uploaded_video_url = self.minio_utils.upload_file(
+                        file_path=save_path,
+                        object_name=object_name,
+                        content_type="video/mp4",
+                    )
+                    logger.info(f"uploaded video to minio: {uploaded_video_url}")
+                except Exception as e:
+                    logger.error(f"failed upload video to minio: {e}")
+
+                # write results to bytes and upload
+                try:
+                    results_txt = "".join(results)
+                    object_name_txt = f"tracked/{timestamp}/{osp.splitext(base_name)[0]}_results.txt"
+                    self.minio_utils.upload_bytes(
+                        file_data=results_txt.encode("utf-8"),
+                        object_name=object_name_txt,
+                        content_type="text/plain",
+                    )
+                    uploaded_results_url = self.minio_utils.presigned_get_object(object_name_txt)
+                    logger.info(f"uploaded results to minio: {uploaded_results_url}")
+                except Exception as e:
+                    logger.error(f"failed upload results to minio: {e}")
+
+            # cleanup temp files
+            try:
+                if osp.exists(save_path):
+                    os.remove(save_path)
+            except Exception:
+                pass
+
+        return uploaded_video_url
